@@ -49,6 +49,13 @@ const BAN_COMMAND: &str = "ban";
 const UNBAN_COMMAND: &str = "unban";
 const APPEAL_COMMAND: &str = "appeal";
 const APPEALS_COMMAND: &str = "appeals";
+/// Prefix of the audit reason stored on an appeal's held timeline row. The
+/// engine uses it to recognise a held appeal and, on a TUI decision, route the
+/// resolution back to this module (and unblock the user on approval).
+const BLOCK_APPEAL_REASON_PREFIX: &str = "block appeal ";
+/// Engine→module query carrying a TUI audit decision. Sent over the existing
+/// `DatabaseQueryResult` payload, so no proto change is needed.
+const BLOCK_APPEAL_RESOLVE_QUERY: &str = "block_appeal_resolve";
 /// Every command this module owns. Incoming commands outside this set are
 /// ignored (the engine routes registered commands; anything else is not ours).
 const COMMANDS: [&str; 6] = [
@@ -246,6 +253,11 @@ fn now_ms() -> i64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Appeal {
     id: String,
+    /// The pipeline message uuid7 this appeal was filed from. It is also the
+    /// uuid7 of the held-for-audit timeline row the TUI reviews, so an audit
+    /// decision can be matched back to this appeal. Older entries lack it.
+    #[serde(default)]
+    audit_uuid7: String,
     user_uuid7: String,
     platform: String,
     handle: String,
@@ -309,10 +321,35 @@ impl Appeals {
     /// Resolve a pending appeal by id/prefix, recording who resolved it and
     /// when. Returns whether a pending appeal was matched.
     fn resolve(&self, id: &str, status: &str, resolver: &str) -> Result<bool, String> {
+        self.resolve_matching(status, resolver, |a| {
+            a.id == id || a.id.starts_with(id)
+        })
+    }
+
+    /// Resolve the pending appeal filed from the given pipeline message uuid7
+    /// (the TUI audit row). Used for decisions made in the audit window.
+    fn resolve_by_audit(
+        &self,
+        audit_uuid7: &str,
+        status: &str,
+        resolver: &str,
+    ) -> Result<bool, String> {
+        if audit_uuid7.is_empty() {
+            return Ok(false);
+        }
+        self.resolve_matching(status, resolver, |a| a.audit_uuid7 == audit_uuid7)
+    }
+
+    fn resolve_matching(
+        &self,
+        status: &str,
+        resolver: &str,
+        matches: impl Fn(&Appeal) -> bool,
+    ) -> Result<bool, String> {
         let mut all = self.load();
         let mut found = false;
         for a in all.iter_mut() {
-            if a.status == "pending" && (a.id == id || a.id.starts_with(id)) {
+            if a.status == "pending" && matches(a) {
                 a.status = status.to_string();
                 a.resolved_by = Some(resolver.to_string());
                 a.resolved_at = Some(now_ms());
@@ -450,6 +487,39 @@ fn deleting_reply_container(
     send_container_for(id, send)
 }
 
+/// An AuditFlag container: ask the engine to hold the appeal's timeline row so
+/// it shows in the TUI audit queue. The reason carries our marker (the engine
+/// then routes the decision back to us) plus the appeal id for the operator.
+fn audit_flag_container(id: &EngineIdentity, message_uuid7: &str, appeal_id: &str) -> ContainerForEngine {
+    ContainerForEngine {
+        version: 2,
+        auth_token: id.auth.clone(),
+        module_name: id.module.clone(),
+        module_instance_uuid7: id.instance.clone(),
+        payload: Some(EnginePayload::AuditFlag(AuditFlag {
+            message_uuid7: message_uuid7.to_string(),
+            reason: format!("{BLOCK_APPEAL_REASON_PREFIX}{appeal_id}"),
+            origin: id.module.clone(),
+        })),
+    }
+}
+
+/// Apply a TUI audit decision relayed by the engine (`DatabaseQueryResult`
+/// query_id [`BLOCK_APPEAL_RESOLVE_QUERY`]). The engine already unblocked the
+/// user on approval, so this only keeps the local appeal record in step.
+/// Returns whether a pending appeal was resolved.
+fn handle_appeal_resolution(appeals: &Appeals, res: &DatabaseQueryResult) -> Result<bool, String> {
+    let payload: serde_json::Value = serde_json::from_slice(&res.result_blob)
+        .map_err(|e| format!("invalid appeal resolution payload: {e}"))?;
+    let uuid7 = payload.get("uuid7").and_then(|v| v.as_str()).unwrap_or("");
+    let status = payload
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| if res.success { "approved".to_string() } else { "denied".to_string() });
+    appeals.resolve_by_audit(uuid7, &status, "tui")
+}
+
 /// A DatabaseQuery container carrying a JSON payload in `sql` (the reprimand
 /// convention: the engine's user-DB handlers parse `sql` as their arguments).
 fn db_container(id: &EngineIdentity, query_id: &str, payload: &serde_json::Value) -> ContainerForEngine {
@@ -474,6 +544,7 @@ fn db_container(id: &EngineIdentity, query_id: &str, payload: &serde_json::Value
 fn handle_command(
     id: &EngineIdentity,
     chat: &ChatMessage,
+    message_uuid7: &str,
     appeals: &Appeals,
     settings: &Settings,
     name: &str,
@@ -484,7 +555,7 @@ fn handle_command(
         UNBLOCK_COMMAND | UNBAN_COMMAND => {
             handle_block(id, chat, settings, UNBLOCK_COMMAND, args)
         }
-        APPEAL_COMMAND => handle_appeal(id, chat, appeals, settings, args),
+        APPEAL_COMMAND => handle_appeal(id, chat, message_uuid7, appeals, settings, args),
         APPEALS_COMMAND => handle_appeals(id, chat, appeals, settings),
         _ => Vec::new(),
     }
@@ -553,6 +624,7 @@ fn handle_block(
 fn handle_appeal(
     id: &EngineIdentity,
     chat: &ChatMessage,
+    message_uuid7: &str,
     appeals: &Appeals,
     settings: &Settings,
     args: &str,
@@ -576,6 +648,7 @@ fn handle_appeal(
     }
     let appeal = Appeal {
         id: uuid::Uuid::now_v7().to_string(),
+        audit_uuid7: message_uuid7.to_string(),
         user_uuid7: chat.user_uuid7.clone(),
         platform: chat.platform.clone(),
         handle: chat
@@ -590,14 +663,25 @@ fn handle_appeal(
         resolved_by: None,
         resolved_at: None,
     };
+    let appeal_id = appeal.id.clone();
     match appeals.append(appeal) {
-        // Acknowledge without echoing the appeal text, and delete the trigger.
-        Ok(()) => vec![deleting_reply_container(
-            id,
-            chat,
-            "Your appeal was logged. A moderator will review it.",
-            platform_message_id(&chat.raw_data),
-        )],
+        // Hold the appeal's timeline row for the TUI audit queue, then
+        // acknowledge without echoing the appeal text and delete the trigger.
+        // The audit flag must be sent BEFORE this module's pre-process ack
+        // (sent by the caller afterwards) so the hold lands.
+        Ok(()) => {
+            let mut out = Vec::new();
+            if !message_uuid7.is_empty() {
+                out.push(audit_flag_container(id, message_uuid7, &appeal_id));
+            }
+            out.push(deleting_reply_container(
+                id,
+                chat,
+                "Your appeal was logged. A moderator will review it.",
+                platform_message_id(&chat.raw_data),
+            ));
+            out
+        }
         Err(e) => vec![reply_container(id, chat, format!("Could not log your appeal: {e}"))],
     }
 }
@@ -753,6 +837,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         send_container(&write_for_task, reply).await;
                     }
                     Some(ModulePayload::DatabaseQueryResult(res)) => {
+                        // A TUI audit decision on a held appeal: keep the local
+                        // record in step. The engine has already unblocked the
+                        // user on approval, so we do not emit another unblock.
+                        if res.query_id == BLOCK_APPEAL_RESOLVE_QUERY {
+                            match handle_appeal_resolution(&appeals, &res) {
+                                Ok(true) => info!("appeal resolved from TUI: {}", res.query_id),
+                                Ok(false) => {}
+                                Err(e) => warn!("appeal resolution from TUI failed: {}", e),
+                            }
+                            continue;
+                        }
                         if !res.success {
                             eprintln!(
                                 "[block] query '{}' failed: {}",
@@ -806,6 +901,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let out = handle_command(
                                         &id,
                                         chat,
+                                        &uuid,
                                         &appeals,
                                         &settings,
                                         &cmd.command_name,
@@ -1011,6 +1107,14 @@ mod tests {
             })
             .collect()
     }
+    fn audit_flags(v: &[ContainerForEngine]) -> Vec<AuditFlag> {
+        v.iter()
+            .filter_map(|c| match &c.payload {
+                Some(EnginePayload::AuditFlag(f)) => Some(f.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 
     // ── pure helpers ────────────────────────────────────────────────────────
 
@@ -1074,6 +1178,7 @@ mod tests {
     fn sample_appeal(id: &str) -> Appeal {
         Appeal {
             id: id.into(),
+            audit_uuid7: String::new(),
             user_uuid7: "u1".into(),
             platform: "discord".into(),
             handle: "bob".into(),
@@ -1119,6 +1224,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn tui_resolution_updates_the_matching_appeal_by_audit_uuid() {
+        let dir = temp_dir();
+        let store = Appeals::new(dir.to_string_lossy().to_string());
+        let mut appeal = sample_appeal("aaaa1111-0000-0000-0000-000000000000");
+        appeal.audit_uuid7 = "pipe-aaaa".into();
+        store.append(appeal).unwrap();
+        store.append(sample_appeal("bbbb2222-0000-0000-0000-000000000000")).unwrap();
+
+        let res = DatabaseQueryResult {
+            query_id: BLOCK_APPEAL_RESOLVE_QUERY.into(),
+            success: true,
+            error: String::new(),
+            result_blob: serde_json::json!({
+                "uuid7": "pipe-aaaa",
+                "status": "approved",
+            })
+            .to_string()
+            .into_bytes(),
+        };
+        assert!(handle_appeal_resolution(&store, &res).unwrap());
+
+        let approved = store.find("aaaa").unwrap();
+        assert_eq!(approved.status, "approved");
+        assert_eq!(approved.resolved_by.as_deref(), Some("tui"));
+        // Only the matching appeal changed.
+        assert_eq!(store.find("bbbb").unwrap().status, "pending");
+        // An unknown/empty audit uuid is a no-op.
+        assert!(!store.resolve_by_audit("", "denied", "tui").unwrap());
+        assert!(!store.resolve_by_audit("nope", "denied", "tui").unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── end-to-end command handling ─────────────────────────────────────────
 
     #[test]
@@ -1127,7 +1266,7 @@ mod tests {
         let dir = temp_dir();
         let store = Appeals::new(dir.to_string_lossy().to_string());
         let s = settings(dir.to_string_lossy().as_ref());
-        let out = handle_command(&id, &chat("u1", "c", "m1", "!block @bob rude", member()), &store, &s, BLOCK_COMMAND, "@bob rude");
+        let out = handle_command(&id, &chat("u1", "c", "m1", "!block @bob rude", member()), "pipe-1", &store, &s, BLOCK_COMMAND, "@bob rude");
         let sent = sends(&out);
         assert_eq!(sent.len(), 1);
         assert!(sent[0].msg.to_lowercase().contains("moderator"));
@@ -1140,7 +1279,7 @@ mod tests {
         let dir = temp_dir();
         let store = Appeals::new(dir.to_string_lossy().to_string());
         let s = settings(dir.to_string_lossy().as_ref());
-        let out = handle_command(&id, &chat("u1", "c", "m1", "!block @bob rude", moderator()), &store, &s, BLOCK_COMMAND, "@bob rude");
+        let out = handle_command(&id, &chat("u1", "c", "m1", "!block @bob rude", moderator()), "pipe-1", &store, &s, BLOCK_COMMAND, "@bob rude");
         let q = db_queries(&out);
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].query_id, "userdb_block");
@@ -1163,7 +1302,7 @@ mod tests {
         let dir = temp_dir();
         let store = Appeals::new(dir.to_string_lossy().to_string());
         let s = settings(dir.to_string_lossy().as_ref());
-        let out = handle_command(&id, &chat("u1", "c", "m1", "!unblock bob", admin()), &store, &s, UNBLOCK_COMMAND, "bob");
+        let out = handle_command(&id, &chat("u1", "c", "m1", "!unblock bob", admin()), "pipe-1", &store, &s, UNBLOCK_COMMAND, "bob");
         let q = db_queries(&out);
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].query_id, "userdb_unblock");
@@ -1180,7 +1319,7 @@ mod tests {
         let dir = temp_dir();
         let store = Appeals::new(dir.to_string_lossy().to_string());
         let s = settings(dir.to_string_lossy().as_ref());
-        let out = handle_command(&id, &chat("u1", "c", "m1", "!ban @bob rude", moderator()), &store, &s, BAN_COMMAND, "@bob rude");
+        let out = handle_command(&id, &chat("u1", "c", "m1", "!ban @bob rude", moderator()), "pipe-1", &store, &s, BAN_COMMAND, "@bob rude");
         let q = db_queries(&out);
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].query_id, "userdb_block");
@@ -1189,7 +1328,7 @@ mod tests {
         assert_eq!(payload["reason"], "rude");
         assert_eq!(sends(&out)[0].msg, "blocked @bob: rude");
         // Same mod gating: a member is refused and no query is emitted.
-        let denied = handle_command(&id, &chat("u2", "c", "m2", "!ban bob", member()), &store, &s, BAN_COMMAND, "bob");
+        let denied = handle_command(&id, &chat("u2", "c", "m2", "!ban bob", member()), "pipe-1", &store, &s, BAN_COMMAND, "bob");
         assert!(db_queries(&denied).is_empty());
         assert!(sends(&denied)[0].msg.to_lowercase().contains("moderator"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1201,7 +1340,7 @@ mod tests {
         let dir = temp_dir();
         let store = Appeals::new(dir.to_string_lossy().to_string());
         let s = settings(dir.to_string_lossy().as_ref());
-        let out = handle_command(&id, &chat("u1", "c", "m1", "!unban bob", admin()), &store, &s, UNBAN_COMMAND, "bob");
+        let out = handle_command(&id, &chat("u1", "c", "m1", "!unban bob", admin()), "pipe-1", &store, &s, UNBAN_COMMAND, "bob");
         let q = db_queries(&out);
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].query_id, "userdb_unblock");
@@ -1217,7 +1356,7 @@ mod tests {
         let dir = temp_dir();
         let store = Appeals::new(dir.to_string_lossy().to_string());
         let s = settings(dir.to_string_lossy().as_ref());
-        let out = handle_command(&id, &chat("u1", "c", "m1", "!block", moderator()), &store, &s, BLOCK_COMMAND, "");
+        let out = handle_command(&id, &chat("u1", "c", "m1", "!block", moderator()), "pipe-1", &store, &s, BLOCK_COMMAND, "");
         assert!(sends(&out)[0].msg.contains("Usage"));
         assert!(db_queries(&out).is_empty());
     }
@@ -1231,6 +1370,7 @@ mod tests {
         let out = handle_command(
             &id,
             &chat("u1", "c", "m7", "!appeal please unblock me", banned()),
+            "pipe-1",
             &store,
             &s,
             APPEAL_COMMAND,
@@ -1241,6 +1381,13 @@ mod tests {
         assert_eq!(sent[0].delete_message_id, "m7");
         assert!(!sent[0].msg.contains("please unblock me"));
 
+        // The appeal is also submitted to the engine audit queue.
+        let flags = audit_flags(&out);
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].message_uuid7, "pipe-1");
+        assert_eq!(flags[0].origin, "block");
+        assert!(flags[0].reason.starts_with(BLOCK_APPEAL_REASON_PREFIX));
+
         let pending = store.pending();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].text, "please unblock me");
@@ -1248,6 +1395,7 @@ mod tests {
         assert_eq!(pending[0].platform, "discord");
         assert_eq!(pending[0].channel, "c");
         assert_eq!(pending[0].status, "pending");
+        assert_eq!(pending[0].audit_uuid7, "pipe-1");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1263,6 +1411,7 @@ mod tests {
         let no_ban = handle_command(
             &id,
             &chat("u1", "c", "m7", "!appeal let me in", member()),
+            "pipe-1",
             &store,
             &s,
             APPEAL_COMMAND,
@@ -1280,6 +1429,7 @@ mod tests {
         let lifted = handle_command(
             &id,
             &chat("u1", "c", "m8", "!appeal let me in", ud),
+            "pipe-1",
             &store,
             &s,
             APPEAL_COMMAND,
@@ -1314,11 +1464,11 @@ mod tests {
         store.append(sample_appeal("cccc3333-0000-0000-0000-000000000000")).unwrap();
 
         // A member sees nothing useful.
-        let denied = handle_command(&id, &chat("u9", "c", "m1", "!appeals", member()), &store, &s, APPEALS_COMMAND, "");
+        let denied = handle_command(&id, &chat("u9", "c", "m1", "!appeals", member()), "pipe-1", &store, &s, APPEALS_COMMAND, "");
         assert!(sends(&denied)[0].msg.to_lowercase().contains("moderator"));
 
         // A mod sees the pending appeal as `id · @handle · reason`.
-        let out = handle_command(&id, &chat("u1", "c", "m1", "!appeals", moderator()), &store, &s, APPEALS_COMMAND, "");
+        let out = handle_command(&id, &chat("u1", "c", "m1", "!appeals", moderator()), "pipe-1", &store, &s, APPEALS_COMMAND, "");
         let msg = &sends(&out)[0].msg;
         assert!(msg.contains("cccc3333-0000-0000-0000-000000000000"));
         assert!(msg.contains("@bob"));
@@ -1338,6 +1488,7 @@ mod tests {
         let out = handle_command(
             &id,
             &chat("u1", "c", "m1", "!appeal approve dddd", moderator()),
+            "pipe-1",
             &store,
             &s,
             APPEAL_COMMAND,
@@ -1367,6 +1518,7 @@ mod tests {
         let out = handle_command(
             &id,
             &chat("u1", "c", "m1", "!appeal deny eeee", admin()),
+            "pipe-1",
             &store,
             &s,
             APPEAL_COMMAND,
@@ -1392,6 +1544,7 @@ mod tests {
         let out = handle_command(
             &id,
             &chat("u1", "c", "m1", "!appeal approve ffff", moderator()),
+            "pipe-1",
             &store,
             &s,
             APPEAL_COMMAND,
@@ -1411,7 +1564,7 @@ mod tests {
         let dir = temp_dir();
         let store = Appeals::new(dir.to_string_lossy().to_string());
         let s = settings(dir.to_string_lossy().as_ref());
-        let out = handle_command(&id, &chat("u1", "c", "m1", "!nope", moderator()), &store, &s, "nope", "");
+        let out = handle_command(&id, &chat("u1", "c", "m1", "!nope", moderator()), "pipe-1", &store, &s, "nope", "");
         assert!(out.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
