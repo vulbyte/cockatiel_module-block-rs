@@ -1,0 +1,82 @@
+{
+  "authority": 0,
+  "autostart": true,
+  "binary": {
+    "linux": {
+      "aarch64": "target/release/cockatiel-block",
+      "arm": "target/release/cockatiel-block",
+      "x86_64": "target/release/cockatiel-block"
+    },
+    "macos": {
+      "aarch64": "target/release/cockatiel-block",
+      "arm": "target/release/cockatiel-block",
+      "x86_64": "target/release/cockatiel-block"
+    },
+    "windows": {
+      "aarch64": "target/release/cockatiel-block.exe",
+      "arm": "target/release/cockatiel-block.exe",
+      "x86_64": "target/release/cockatiel-block.exe"
+    }
+  },
+  "build_command": "cargo",
+  "build_flags": [
+    "build",
+    "--release"
+  ],
+  "capabilities": "preprocess",
+  "command_flags": [
+    "run",
+    "--release"
+  ],
+  "credentials": [
+    {
+      "key": "command_flag",
+      "label": "Command Flag",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "data_dir",
+      "label": "Data directory",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "block_authority",
+      "label": "Block authority (mod/admin/owner)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "approve_authority",
+      "label": "Appeal resolution authority (mod/admin/owner)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "reconnect_base_secs",
+      "label": "Reconnect base (s)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "reconnect_max_secs",
+      "label": "Reconnect max (s)",
+      "list": false,
+      "sensitive": false
+    }
+  ],
+  "description": "moderator blocking + appeals — !block/!unblock (mod-gated, user DB), !appeal <text> (logged to appeals.json, trigger deleted), !appeals and !appeal approve/deny (mod-gated)",
+  "launch_command": "cargo",
+  "min_rank": 0,
+  "name": "block",
+  "price": 0,
+  "release": {
+    "base_url": "https://github.com/vulbyte/cockatiel_module-block-rs/releases/download",
+    "repo": "vulbyte/cockatiel_module-block-rs",
+    "tag": "v0.1.0"
+  },
+  "root_file": "./src/main.rs",
+  "terminal": false,
+  "version": "0.1.0"
+}

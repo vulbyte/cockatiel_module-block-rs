@@ -1,0 +1,11 @@
+/target/
+config.json
+.env
+.env.local
+*.db
+*.db-shm
+*.db-wal
+*.log
+.DS_Store
+*.pem
+*.key
