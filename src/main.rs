@@ -6,8 +6,10 @@
 //! moderator of sufficient authority.
 //!
 //!   `!block <user> [reason]`   block a user (mod-gated)
+//!   `!ban <user> [reason]`     alias of `!block`
 //!   `!unblock <user>`          unblock a user (mod-gated)
-//!   `!appeal <text>`           file an appeal (logged, trigger message deleted)
+//!   `!unban <user>`            alias of `!unblock`
+//!   `!appeal <text>`           file an appeal (banned users only; logged, trigger message deleted)
 //!   `!appeals`                 list pending appeals (mod-gated)
 //!   `!appeal approve <id>`     approve an appeal → emit an unblock (mod-gated)
 //!   `!appeal deny <id>`        deny an appeal (mod-gated)
@@ -22,6 +24,7 @@
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
@@ -40,11 +43,22 @@ type WsWriteHalf = futures_util::stream::SplitSink<
 
 const BLOCK_COMMAND: &str = "block";
 const UNBLOCK_COMMAND: &str = "unblock";
+/// Aliases for `!block` / `!unblock`; normalized to their canonical command
+/// before handling so behaviour (gating, reply, query) is identical.
+const BAN_COMMAND: &str = "ban";
+const UNBAN_COMMAND: &str = "unban";
 const APPEAL_COMMAND: &str = "appeal";
 const APPEALS_COMMAND: &str = "appeals";
 /// Every command this module owns. Incoming commands outside this set are
 /// ignored (the engine routes registered commands; anything else is not ours).
-const COMMANDS: [&str; 4] = [BLOCK_COMMAND, UNBLOCK_COMMAND, APPEAL_COMMAND, APPEALS_COMMAND];
+const COMMANDS: [&str; 6] = [
+    BLOCK_COMMAND,
+    BAN_COMMAND,
+    UNBLOCK_COMMAND,
+    UNBAN_COMMAND,
+    APPEAL_COMMAND,
+    APPEALS_COMMAND,
+];
 
 const DEFAULT_FLAG: &str = "!";
 const DEFAULT_DATA_DIR: &str = "~/.cockatiel/block";
@@ -181,6 +195,21 @@ fn has_authority(user_data: Option<&UserData>, authority: &str) -> bool {
     }
 }
 
+/// Whether the message author currently has at least one active ban, as
+/// enriched by the engine into `chat.user_data.bans` (a `Ban` with
+/// `unbanned == false`). Only banned users may appeal.
+///
+/// NOTE: "banned in a specific module" is not surfaced here — a per-module ban
+/// would need the engine to populate module-scoped ban entries, which depends
+/// on the not-yet-landed per-module bans feature. When it lands, extend this
+/// predicate to consider that source too.
+fn user_is_banned(chat: &ChatMessage) -> bool {
+    chat.user_data
+        .as_ref()
+        .map(|u| u.bans.iter().any(|b| !b.unbanned))
+        .unwrap_or(false)
+}
+
 /// The actor block for a DatabaseQuery payload: who triggered the action.
 fn actor_json(chat: &ChatMessage) -> serde_json::Value {
     serde_json::json!({
@@ -308,6 +337,16 @@ struct EngineIdentity {
     module: String,
 }
 
+/// A block/unblock command awaiting the engine's answer. The engine's
+/// `DatabaseQueryResult` only carries the (shared) `query_id`, so the context
+/// needed to report a failure back to the channel is stashed here, FIFO per
+/// query id.
+struct PendingBlock {
+    chat: ChatMessage,
+    handle: String,
+    is_block: bool,
+}
+
 /// Encode and send a ContainerForEngine on the shared write half.
 async fn send_container(write: &Arc<AsyncMutex<WsWriteHalf>>, container: ContainerForEngine) {
     let mut buf = Vec::new();
@@ -340,7 +379,9 @@ async fn register_commands(
         payload: Some(EnginePayload::Commands(Commands {
             commands: vec![
                 cmd(BLOCK_COMMAND, "block a user (moderator only)"),
+                cmd(BAN_COMMAND, "block a user, alias of !block (moderator only)"),
                 cmd(UNBLOCK_COMMAND, "unblock a user (moderator only)"),
+                cmd(UNBAN_COMMAND, "unblock a user, alias of !unblock (moderator only)"),
                 cmd(APPEAL_COMMAND, "file an appeal, or approve/deny one (moderator only)"),
                 cmd(APPEALS_COMMAND, "list pending appeals (moderator only)"),
             ],
@@ -348,7 +389,15 @@ async fn register_commands(
         })),
     };
     send_container(write, commands).await;
-    info!("registered !{} / !{} / !{} / !{} commands", BLOCK_COMMAND, UNBLOCK_COMMAND, APPEAL_COMMAND, APPEALS_COMMAND);
+    info!(
+        "registered !{} / !{} / !{} / !{} / !{} / !{} commands",
+        BLOCK_COMMAND,
+        BAN_COMMAND,
+        UNBLOCK_COMMAND,
+        UNBAN_COMMAND,
+        APPEAL_COMMAND,
+        APPEALS_COMMAND
+    );
 }
 
 /// Build a base SendToPlatforms (actor = the chat author).
@@ -431,7 +480,10 @@ fn handle_command(
     args: &str,
 ) -> Vec<ContainerForEngine> {
     match name {
-        BLOCK_COMMAND | UNBLOCK_COMMAND => handle_block(id, chat, settings, name, args),
+        BLOCK_COMMAND | BAN_COMMAND => handle_block(id, chat, settings, BLOCK_COMMAND, args),
+        UNBLOCK_COMMAND | UNBAN_COMMAND => {
+            handle_block(id, chat, settings, UNBLOCK_COMMAND, args)
+        }
         APPEAL_COMMAND => handle_appeal(id, chat, appeals, settings, args),
         APPEALS_COMMAND => handle_appeals(id, chat, appeals, settings),
         _ => Vec::new(),
@@ -439,8 +491,9 @@ fn handle_command(
 }
 
 /// `!block <user> [reason]` / `!unblock <user>` — mod-gated, emits a
-/// `userdb_block` / `userdb_unblock` DatabaseQuery. Success is not replied to;
-/// authorization failure is.
+/// `userdb_block` / `userdb_unblock` DatabaseQuery. Always replies: an
+/// acknowledgement on success, a "not a moderator" refusal on authorization
+/// failure, and (from the read loop) a failure reply if the engine query fails.
 fn handle_block(
     id: &EngineIdentity,
     chat: &ChatMessage,
@@ -449,7 +502,7 @@ fn handle_block(
     args: &str,
 ) -> Vec<ContainerForEngine> {
     if !has_authority(chat.user_data.as_ref(), &settings.block_authority) {
-        return vec![reply_container(id, chat, "Only moderators can use that command.")];
+        return vec![reply_container(id, chat, "You are not a moderator.")];
     }
     let is_block = name == BLOCK_COMMAND;
     let usage = if is_block {
@@ -470,14 +523,33 @@ fn handle_block(
         "reason": reason,
         "actor": actor_json(chat),
     });
-    vec![db_container(
-        id,
-        if is_block { "userdb_block" } else { "userdb_unblock" },
-        &payload,
-    )]
+    // Acknowledge immediately (so the command is never silent) alongside the
+    // engine query; a query failure is reported later from the DatabaseQueryResult
+    // path (see the read loop).
+    let ack = if is_block {
+        if reason.is_empty() {
+            format!("blocked @{handle}")
+        } else {
+            format!("blocked @{handle}: {reason}")
+        }
+    } else {
+        format!("unblocked @{handle}")
+    };
+    vec![
+        reply_container(id, chat, ack),
+        db_container(
+            id,
+            if is_block { "userdb_block" } else { "userdb_unblock" },
+            &payload,
+        ),
+    ]
 }
 
 /// `!appeal <text>` (file) or `!appeal approve|deny <id>` (resolve).
+///
+/// Filing only works for a currently-banned user (see [`user_is_banned`]): a
+/// non-banned user is told they need not appeal and their message is left alone
+/// (not logged, not deleted).
 fn handle_appeal(
     id: &EngineIdentity,
     chat: &ChatMessage,
@@ -495,6 +567,12 @@ fn handle_appeal(
             chat,
             format!("Usage: `{}{} <text>`.", settings.command_flag, APPEAL_COMMAND),
         )];
+    }
+    // Only a user who is actually banned (an active, not-yet-unbanned ban) may
+    // appeal. A non-banned user is told so; their message is neither logged nor
+    // deleted.
+    if !user_is_banned(chat) {
+        return vec![reply_container(id, chat, "You have no bans, no need to appeal.")];
     }
     let appeal = Appeal {
         id: uuid::Uuid::now_v7().to_string(),
@@ -640,6 +718,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         let mut read = read;
         let appeals = Appeals::new(settings.data_dir.clone());
+        // In-flight block/unblock commands awaiting their engine answer, so a
+        // failed query can be reported back to the channel (never silent).
+        let mut pending: HashMap<String, VecDeque<PendingBlock>> = HashMap::new();
         loop {
             register_commands(&write_for_task, &identity_for_task, &settings.command_flag).await;
             loop {
@@ -678,6 +759,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 res.query_id, res.error
                             );
                         }
+                        // Report a failed block/unblock back to the channel so
+                        // the command is never silent. Successful queries were
+                        // already acknowledged when the command was issued.
+                        if !res.success
+                            && (res.query_id == "userdb_block"
+                                || res.query_id == "userdb_unblock")
+                        {
+                            if let Some(queue) = pending.get_mut(&res.query_id) {
+                                if let Some(p) = queue.pop_front() {
+                                    let verb = if p.is_block { "block" } else { "unblock" };
+                                    let msg =
+                                        format!("could not {verb} @{}: {}", p.handle, res.error);
+                                    send_container(
+                                        &write_for_task,
+                                        reply_container(&id, &p.chat, msg),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
                     }
                     Some(ModulePayload::MessagePreProcess(pre)) => {
                         let MessagePreProcess { message_uuid7: uuid, raw_message, audio, audio_type } = pre;
@@ -710,6 +811,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         &cmd.command_name,
                                         &args,
                                     );
+                                    // Track any block/unblock query we just
+                                    // emitted so a failed result can be
+                                    // reported to the channel.
+                                    for c in &out {
+                                        if let Some(EnginePayload::DatabaseQuery(q)) = &c.payload {
+                                            if q.query_id == "userdb_block"
+                                                || q.query_id == "userdb_unblock"
+                                            {
+                                                if let Ok(p) = serde_json::from_str::<
+                                                    serde_json::Value,
+                                                >(
+                                                    &q.sql
+                                                ) {
+                                                    let handle = p
+                                                        .get("handle")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("")
+                                                        .to_string();
+                                                    pending
+                                                        .entry(q.query_id.clone())
+                                                        .or_default()
+                                                        .push_back(PendingBlock {
+                                                            chat: chat.clone(),
+                                                            handle,
+                                                            is_block: q
+                                                                .query_id
+                                                                == "userdb_block",
+                                                        });
+                                                }
+                                            }
+                                        }
+                                    }
                                     for c in out {
                                         send_container(&write_for_task, c).await;
                                     }
@@ -852,6 +985,14 @@ mod tests {
     }
     fn admin() -> UserData {
         UserData { username: "admin".into(), is_admin: true, ..Default::default() }
+    }
+    /// A user with one active (not-yet-unbanned) ban in `user_data.bans`.
+    fn banned() -> UserData {
+        UserData {
+            username: "bad".into(),
+            bans: vec![Ban { unbanned: false, ..Default::default() }],
+            ..Default::default()
+        }
     }
 
     fn db_queries(v: &[ContainerForEngine]) -> Vec<DatabaseQuery> {
@@ -1010,8 +1151,10 @@ mod tests {
         assert_eq!(payload["reason"], "rude");
         assert_eq!(payload["actor"]["uuid7"], "u1");
         assert_eq!(payload["actor"]["handle"], "mod");
-        // No chat reply on success.
-        assert!(sends(&out).is_empty());
+        // A visible acknowledgement accompanies the query.
+        let sent = sends(&out);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].msg, "blocked @bob: rude");
     }
 
     #[test]
@@ -1027,6 +1170,45 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&q[0].sql).unwrap();
         assert_eq!(payload["handle"], "bob");
         assert_eq!(payload["reason"], "");
+        // A visible acknowledgement accompanies the query.
+        assert_eq!(sends(&out)[0].msg, "unblocked @bob");
+    }
+
+    #[test]
+    fn ban_is_alias_of_block() {
+        let id = test_identity();
+        let dir = temp_dir();
+        let store = Appeals::new(dir.to_string_lossy().to_string());
+        let s = settings(dir.to_string_lossy().as_ref());
+        let out = handle_command(&id, &chat("u1", "c", "m1", "!ban @bob rude", moderator()), &store, &s, BAN_COMMAND, "@bob rude");
+        let q = db_queries(&out);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].query_id, "userdb_block");
+        let payload: serde_json::Value = serde_json::from_str(&q[0].sql).unwrap();
+        assert_eq!(payload["handle"], "bob");
+        assert_eq!(payload["reason"], "rude");
+        assert_eq!(sends(&out)[0].msg, "blocked @bob: rude");
+        // Same mod gating: a member is refused and no query is emitted.
+        let denied = handle_command(&id, &chat("u2", "c", "m2", "!ban bob", member()), &store, &s, BAN_COMMAND, "bob");
+        assert!(db_queries(&denied).is_empty());
+        assert!(sends(&denied)[0].msg.to_lowercase().contains("moderator"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unban_is_alias_of_unblock() {
+        let id = test_identity();
+        let dir = temp_dir();
+        let store = Appeals::new(dir.to_string_lossy().to_string());
+        let s = settings(dir.to_string_lossy().as_ref());
+        let out = handle_command(&id, &chat("u1", "c", "m1", "!unban bob", admin()), &store, &s, UNBAN_COMMAND, "bob");
+        let q = db_queries(&out);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].query_id, "userdb_unblock");
+        let payload: serde_json::Value = serde_json::from_str(&q[0].sql).unwrap();
+        assert_eq!(payload["handle"], "bob");
+        assert_eq!(sends(&out)[0].msg, "unblocked @bob");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1048,7 +1230,7 @@ mod tests {
         let s = settings(dir.to_string_lossy().as_ref());
         let out = handle_command(
             &id,
-            &chat("u1", "c", "m7", "!appeal please unblock me", member()),
+            &chat("u1", "c", "m7", "!appeal please unblock me", banned()),
             &store,
             &s,
             APPEAL_COMMAND,
@@ -1062,12 +1244,65 @@ mod tests {
         let pending = store.pending();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].text, "please unblock me");
-        assert_eq!(pending[0].handle, "");
+        assert_eq!(pending[0].handle, "bad");
         assert_eq!(pending[0].platform, "discord");
         assert_eq!(pending[0].channel, "c");
         assert_eq!(pending[0].status, "pending");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appeal_from_unbanned_user_is_neither_logged_nor_deleted() {
+        let id = test_identity();
+        let dir = temp_dir();
+        let store = Appeals::new(dir.to_string_lossy().to_string());
+        let s = settings(dir.to_string_lossy().as_ref());
+
+        // No bans at all: refused, nothing logged, message NOT deleted.
+        let no_ban = handle_command(
+            &id,
+            &chat("u1", "c", "m7", "!appeal let me in", member()),
+            &store,
+            &s,
+            APPEAL_COMMAND,
+            "let me in",
+        );
+        let sent = sends(&no_ban);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].msg.contains("no bans"));
+        assert!(sent[0].delete_message_id.is_empty());
+        assert!(store.pending().is_empty());
+
+        // A *previously* banned (unbanned == true) user is treated as unbanned.
+        let mut ud = banned();
+        ud.bans[0].unbanned = true;
+        let lifted = handle_command(
+            &id,
+            &chat("u1", "c", "m8", "!appeal let me in", ud),
+            &store,
+            &s,
+            APPEAL_COMMAND,
+            "let me in",
+        );
+        assert!(sends(&lifted)[0].msg.contains("no bans"));
+        assert!(store.pending().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn user_is_banned_checks_active_bans() {
+        let c = |ud: UserData| chat("u", "c", "m", "!x", ud);
+        assert!(!user_is_banned(&c(member())));
+        assert!(user_is_banned(&c(banned())));
+        let mut lifted = banned();
+        lifted.bans[0].unbanned = true;
+        assert!(!user_is_banned(&c(lifted)));
+        // Missing user_data → not banned.
+        let mut none = c(member());
+        none.user_data = None;
+        assert!(!user_is_banned(&none));
     }
 
     #[test]

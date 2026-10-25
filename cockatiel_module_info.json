@@ -66,7 +66,7 @@
       "sensitive": false
     }
   ],
-  "description": "moderator blocking + appeals — !block/!unblock (mod-gated, user DB), !appeal <text> (logged to appeals.json, trigger deleted), !appeals and !appeal approve/deny (mod-gated)",
+  "description": "moderator blocking + appeals — !block/!unblock and aliases !ban/!unban (mod-gated, user DB), !appeal <text> (logged to appeals.json, trigger deleted), !appeals and !appeal approve/deny (mod-gated)",
   "launch_command": "cargo",
   "min_rank": 0,
   "name": "block",
